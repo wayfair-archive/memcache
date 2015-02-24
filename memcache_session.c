@@ -40,6 +40,8 @@ ps_module ps_mod_memcache = {
 	PS_MOD(memcache)
 };
 
+ZEND_DECLARE_MODULE_GLOBALS(memcache)
+
 /* {{{ PS_OPEN_FUNC
  */
 PS_OPEN_FUNC(memcache)
@@ -64,7 +66,7 @@ PS_OPEN_FUNC(memcache)
 			 j++;
 
 		if (i < j) {
-			int persistent = 0, weight = 1, timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MMC_DEFAULT_RETRY;
+			int persistent = 0, weight = 1, timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MEMCACHE_G(conn_retry_interval);
 			
 			/* translate unix: into file: */
 			if (!strncmp(save_path+i, "unix:", sizeof("unix:")-1)) {

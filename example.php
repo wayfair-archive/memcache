@@ -20,5 +20,3 @@ if ($memcache) {
 else {
 	echo "Connection to memcached failed";
 }
-?>
-

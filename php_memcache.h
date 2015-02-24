@@ -47,7 +47,6 @@ PHP_FUNCTION(memcache_pconnect);
 PHP_FUNCTION(memcache_add_server);
 PHP_FUNCTION(memcache_set_server_params);
 PHP_FUNCTION(memcache_get_server_status);
-PHP_FUNCTION(memcache_get_version);
 PHP_FUNCTION(memcache_add);
 PHP_FUNCTION(memcache_set);
 PHP_FUNCTION(memcache_replace);
@@ -70,7 +69,6 @@ PHP_FUNCTION(memcache_setoptimeout);
 #define MMC_COMPRESSED 2
 #define MMC_DEFAULT_TIMEOUT 1				/* seconds */
 #define MMC_KEY_MAX_SIZE 250				/* stoled from memcached sources =) */
-#define MMC_DEFAULT_RETRY 15 				/* retry failed server after x seconds */
 #define MMC_DEFAULT_SAVINGS 0.2				/* minimum 20% savings for compression to be used */
 #define MMC_DEFAULT_CACHEDUMP_LIMIT	100		/* number of entries */
 
@@ -153,6 +151,7 @@ ZEND_BEGIN_MODULE_GLOBALS(memcache)
 	long hash_strategy;
 	long hash_function;
 	long default_timeout_ms;
+	long conn_retry_interval;
 ZEND_END_MODULE_GLOBALS(memcache)
 
 #if (PHP_MAJOR_VERSION == 5) && (PHP_MINOR_VERSION >= 3)
@@ -169,7 +168,7 @@ ZEND_END_MODULE_GLOBALS(memcache)
 
 /* internal functions */
 mmc_t *mmc_server_new(char *, int, unsigned short, int, int, int TSRMLS_DC);
-mmc_t *mmc_find_persistent(char *, int, int, int, int TSRMLS_DC);
+mmc_t *mmc_find_persistent(char *, int, int, int, long TSRMLS_DC);
 int mmc_server_failure(mmc_t * TSRMLS_DC);
 void mmc_server_deactivate(mmc_t * TSRMLS_DC);
 

@@ -64,7 +64,6 @@ zend_function_entry memcache_functions[] = {
 	PHP_FE(memcache_add_server,		NULL)
 	PHP_FE(memcache_set_server_params,		NULL)
 	PHP_FE(memcache_get_server_status,		NULL)
-	PHP_FE(memcache_get_version,	NULL)
 	PHP_FE(memcache_add,			NULL)
 	PHP_FE(memcache_set,			NULL)
 	PHP_FE(memcache_replace,		NULL)
@@ -88,7 +87,6 @@ static zend_function_entry php_memcache_class_functions[] = {
 	PHP_FALIAS(addserver,		memcache_add_server,		NULL)
 	PHP_FALIAS(setserverparams,		memcache_set_server_params,		NULL)
 	PHP_FALIAS(getserverstatus,		memcache_get_server_status,		NULL)
-	PHP_FALIAS(getversion,		memcache_get_version,		NULL)
 	PHP_FALIAS(add,				memcache_add,				NULL)
 	PHP_FALIAS(set,				memcache_set,				NULL)
 	PHP_FALIAS(replace,			memcache_replace,			NULL)
@@ -207,6 +205,20 @@ static PHP_INI_MH(OnUpdateDefaultTimeout) /* {{{ */
 }
 /* }}} */
 
+static PHP_INI_MH(OnUpdateRetryInterval) /* {{{ */
+{
+	long int lval;
+
+	lval = strtol(new_value, NULL, 10);
+	if (lval < 0) {
+		php_error_docref(NULL TSRMLS_CC, E_WARNING, "memcache.retry_interval must be a positive number greater than or equal to 0 ('%s' given)", new_value);
+		return FAILURE;
+	}
+	MEMCACHE_G(conn_retry_interval) = lval;
+	return SUCCESS;
+}
+/* }}} */
+
 /* {{{ PHP_INI */
 PHP_INI_BEGIN()
 	STD_PHP_INI_ENTRY("memcache.allow_failover",	"1",		PHP_INI_ALL, OnUpdateLong,		allow_failover,	zend_memcache_globals,	memcache_globals)
@@ -216,6 +228,7 @@ PHP_INI_BEGIN()
 	STD_PHP_INI_ENTRY("memcache.hash_strategy",		"standard",	PHP_INI_ALL, OnUpdateHashStrategy,	hash_strategy,	zend_memcache_globals,	memcache_globals)
 	STD_PHP_INI_ENTRY("memcache.hash_function",		"crc32",	PHP_INI_ALL, OnUpdateHashFunction,	hash_function,	zend_memcache_globals,	memcache_globals)
 	STD_PHP_INI_ENTRY("memcache.default_timeout_ms",	"1000",	PHP_INI_ALL, OnUpdateDefaultTimeout,	default_timeout_ms,	zend_memcache_globals,	memcache_globals)
+	STD_PHP_INI_ENTRY("memcache.retry_interval",	"15",	PHP_INI_ALL, OnUpdateRetryInterval,	conn_retry_interval,	zend_memcache_globals,	memcache_globals)
 PHP_INI_END()
 /* }}} */
 
@@ -260,6 +273,7 @@ static void php_memcache_init_globals(zend_memcache_globals *memcache_globals_p 
 	MEMCACHE_G(hash_strategy)	  = MMC_STANDARD_HASH;
 	MEMCACHE_G(hash_function)	  = MMC_HASH_CRC32;
 	MEMCACHE_G(default_timeout_ms)= (MMC_DEFAULT_TIMEOUT) * 1000;
+	MEMCACHE_G(conn_retry_interval)    = 15;
 }
 /* }}} */
 
@@ -500,14 +514,8 @@ static void mmc_server_received_error(mmc_t *mmc, int response_len)  /* {{{ */
 
 int mmc_server_failure(mmc_t *mmc TSRMLS_DC) /*determines if a request should be retried or is a hard network failure {{{ */
 {
-	switch (mmc->status) {
-		case MMC_STATUS_DISCONNECTED:
-			return 0;
-
-		/* attempt reconnect of sockets in unknown state */
-		case MMC_STATUS_UNKNOWN:
-			mmc->status = MMC_STATUS_DISCONNECTED;
-			return 0;
+	if (mmc->status == MMC_STATUS_DISCONNECTED) {
+		return 0;
 	}
 
 	mmc_server_deactivate(mmc TSRMLS_CC);
@@ -745,6 +753,7 @@ int mmc_pool_store(mmc_pool_t *pool, const char *command, int command_len, const
 	mmc_t *mmc;
 	char *request;
 	int request_len, result = -1;
+	int i = 0;
 	char *key_copy = NULL, *data = NULL;
 
 	if (key_len > MMC_KEY_MAX_SIZE) {
@@ -803,7 +812,7 @@ int mmc_pool_store(mmc_pool_t *pool, const char *command, int command_len, const
 
 	request[request_len] = '\0';
 	
-	while (result < 0 && (mmc = mmc_pool_find(pool, key, key_len TSRMLS_CC)) != NULL) {
+	while (result < 0 && (mmc = mmc_pool_find(pool, key, key_len TSRMLS_CC)) != NULL && MEMCACHE_G(allow_failover) && i++ < MEMCACHE_G(max_failover_attempts) + 1) {
 		if ((result = mmc_server_store(mmc, request, request_len TSRMLS_CC)) < 0) {
 			mmc_server_failure(mmc TSRMLS_CC);
 		}
@@ -1014,20 +1023,6 @@ int mmc_open(mmc_t *mmc, int force_connect, char **error_string, int *errnum TSR
 			return _mmc_open(mmc, error_string, errnum TSRMLS_CC);
 
 		case MMC_STATUS_CONNECTED:
-			return 1;
-
-		case MMC_STATUS_UNKNOWN:
-			/* check connection if needed */
-			if (force_connect) {
-				char *version;
-				if ((version = mmc_get_version(mmc TSRMLS_CC)) == NULL && !_mmc_open(mmc, error_string, errnum TSRMLS_CC)) {
-					break;
-				}
-				if (version) {
-					efree(version);
-				}
-				mmc->status = MMC_STATUS_CONNECTED;
-			}
 			return 1;
 
 		case MMC_STATUS_FAILED:
@@ -1275,13 +1270,13 @@ int mmc_exec_retrieval_cmd(mmc_pool_t *pool, const char *key, int key_len, zval 
 {
 	mmc_t *mmc;
 	char *command, *value;
-	int result = -1, command_len, response_len, value_len, flags = 0;
+	int result = -1, command_len, response_len, value_len, flags, i = 0;
 
 	MMC_DEBUG(("mmc_exec_retrieval_cmd: key '%s'", key));
 
 	command_len = spprintf(&command, 0, "get %s", key);
 
-	while (result < 0 && (mmc = mmc_pool_find(pool, key, key_len TSRMLS_CC)) != NULL) {
+	while (result < 0 && (mmc = mmc_pool_find(pool, key, key_len TSRMLS_CC)) != NULL && MEMCACHE_G(allow_failover) && i++ < MEMCACHE_G(max_failover_attempts) + 1) {
 		MMC_DEBUG(("mmc_exec_retrieval_cmd: found server '%s:%d' for key '%s'", mmc->host, mmc->port, key));
 
 		/* send command and read value */
@@ -1308,6 +1303,11 @@ int mmc_exec_retrieval_cmd(mmc_pool_t *pool, const char *key, int key_len, zval 
 		if (result < 0) {
 			mmc_server_failure(mmc TSRMLS_CC);
 		}
+	}
+
+	if (i > MEMCACHE_G(max_failover_attempts) + 1) {
+		mmc_server_seterror(mmc, "Failed to read key", 0);
+		result = -1;
 	}
 
 	if (return_flags != NULL) {
@@ -1496,7 +1496,7 @@ int mmc_delete(mmc_t *mmc, const char *key, int key_len, int time TSRMLS_DC) /* 
 	char *command;
 	int command_len, response_len;
 
-	command_len = spprintf(&command, 0, "delete %s %d", key, time);
+	command_len = spprintf(&command, 0, "delete %s", key);
 
 	MMC_DEBUG(("mmc_delete: trying to delete '%s'", key));
 
@@ -1883,6 +1883,7 @@ static void php_mmc_incr_decr(INTERNAL_FUNCTION_PARAMETERS, int cmd) /* {{{ */
 	mmc_t *mmc;
 	mmc_pool_t *pool;
 	int result = -1, key_len;
+	int i = 0;
 	long value = 1, number;
 	char *key;
 	zval *mmc_object = getThis();
@@ -1908,7 +1909,7 @@ static void php_mmc_incr_decr(INTERNAL_FUNCTION_PARAMETERS, int cmd) /* {{{ */
 		RETURN_FALSE;
 	}
 
-	while (result < 0 && (mmc = mmc_pool_find(pool, key_tmp, key_tmp_len TSRMLS_CC)) != NULL) {
+	while (result < 0 && (mmc = mmc_pool_find(pool, key_tmp, key_tmp_len TSRMLS_CC)) != NULL && MEMCACHE_G(allow_failover) && i++ < MEMCACHE_G(max_failover_attempts) + 1) {
 		if ((result = mmc_incr_decr(mmc, cmd, key_tmp, key_tmp_len, value, &number TSRMLS_CC)) < 0) {
 			mmc_server_failure(mmc TSRMLS_CC);
 		}
@@ -1940,11 +1941,11 @@ static void php_mmc_connect (INTERNAL_FUNCTION_PARAMETERS, int persistent) /* {{
 
 	/* initialize and connect server struct */
 	if (persistent) {
-		mmc = mmc_find_persistent(host, host_len, port, timeout, MMC_DEFAULT_RETRY TSRMLS_CC);
+		mmc = mmc_find_persistent(host, host_len, port, timeout, MEMCACHE_G(conn_retry_interval) TSRMLS_CC);
 	}
 	else {
 		MMC_DEBUG(("php_mmc_connect: creating regular connection"));
-		mmc = mmc_server_new(host, host_len, port, 0, timeout, MMC_DEFAULT_RETRY TSRMLS_CC);
+		mmc = mmc_server_new(host, host_len, port, 0, timeout, MEMCACHE_G(conn_retry_interval) TSRMLS_CC);
 	}
 
 	mmc->timeout = timeout;
@@ -2018,7 +2019,7 @@ PHP_FUNCTION(memcache_add_server)
 	zval **connection, *mmc_object = getThis(), *failure_callback = NULL;
 	mmc_pool_t *pool;
 	mmc_t *mmc;
-	long port = MEMCACHE_G(default_port), weight = 1, timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MMC_DEFAULT_RETRY, timeoutms = 0;
+	long port = MEMCACHE_G(default_port), weight = 1, timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MEMCACHE_G(conn_retry_interval), timeoutms = 0;
 	zend_bool persistent = 1, status = 1;
 	int resource_type, host_len, list_id;
 	char *host;
@@ -2097,7 +2098,7 @@ PHP_FUNCTION(memcache_set_server_params)
 	zval *mmc_object = getThis(), *failure_callback = NULL;
 	mmc_pool_t *pool;
 	mmc_t *mmc = NULL;
-	long port = MEMCACHE_G(default_port), timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MMC_DEFAULT_RETRY;
+	long port = MEMCACHE_G(default_port), timeout = MMC_DEFAULT_TIMEOUT, retry_interval = MEMCACHE_G(conn_retry_interval);
 	zend_bool status = 1;
 	int host_len, i;
 	char *host;
@@ -2206,7 +2207,7 @@ PHP_FUNCTION(memcache_get_server_status)
 }
 /* }}} */
 
-mmc_t *mmc_find_persistent(char *host, int host_len, int port, int timeout, int retry_interval TSRMLS_DC) /* {{{ */
+mmc_t *mmc_find_persistent(char *host, int host_len, int port, int timeout, long retry_interval TSRMLS_DC) /* {{{ */
 {
 	mmc_t *mmc;
 	zend_rsrc_list_entry *le;
@@ -2255,49 +2256,10 @@ mmc_t *mmc_find_persistent(char *host, int host_len, int port, int timeout, int 
 		mmc = (mmc_t *)le->ptr;
 		mmc->timeout = timeout;
 		mmc->retry_interval = retry_interval;
-
-		/* attempt to reconnect this node before failover in case connection has gone away */
-		if (mmc->status == MMC_STATUS_CONNECTED) {
-			mmc->status = MMC_STATUS_UNKNOWN;
-		}
 	}
 
 	efree(hash_key);
 	return mmc;
-}
-/* }}} */
-
-/* {{{ proto string memcache_get_version( object memcache )
-   Returns server's version */
-PHP_FUNCTION(memcache_get_version)
-{
-	mmc_pool_t *pool;
-	char *version;
-	int i;
-	zval *mmc_object = getThis();
-
-	if (mmc_object == NULL) {
-		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "O", &mmc_object, memcache_class_entry_ptr) == FAILURE) {
-			return;
-		}
-	}
-
-	if (!mmc_get_pool(mmc_object, &pool TSRMLS_CC)) {
-		RETURN_FALSE;
-	}
-
-	for (i=0; i<pool->num_servers; i++) {
-		if (mmc_open(pool->servers[i], 1, NULL, NULL TSRMLS_CC)) {
-			if ((version = mmc_get_version(pool->servers[i] TSRMLS_CC)) != NULL) {
-				RETURN_STRING(version, 0);
-			}
-			else {
-				mmc_server_failure(pool->servers[i] TSRMLS_CC);
-			}
-		}
-	}
-
-	RETURN_FALSE;
 }
 /* }}} */
 
@@ -2377,6 +2339,7 @@ PHP_FUNCTION(memcache_delete)
 	mmc_t *mmc;
 	mmc_pool_t *pool;
 	int result = -1, key_len;
+	int i = 0;
 	zval *mmc_object = getThis();
 	char *key;
 	long time = 0;
@@ -2402,7 +2365,7 @@ PHP_FUNCTION(memcache_delete)
 		RETURN_FALSE;
 	}
 
-	while (result < 0 && (mmc = mmc_pool_find(pool, key_tmp, key_tmp_len TSRMLS_CC)) != NULL) {
+	while (result < 0 && (mmc = mmc_pool_find(pool, key_tmp, key_tmp_len TSRMLS_CC)) != NULL && MEMCACHE_G(allow_failover) && i++ < MEMCACHE_G(max_failover_attempts) + 1) {
 		if ((result = mmc_delete(mmc, key_tmp, key_tmp_len, time TSRMLS_CC)) < 0) {
 			mmc_server_failure(mmc TSRMLS_CC);
 		}
