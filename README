@@ -1,3 +1,5 @@
+Forked from https://git.php.net/repository/pecl/caching/memcache.git
+
 memcached module for PHP
 ------------------------
 This module requires zlib library, used for on-the-fly data (de)compression.
