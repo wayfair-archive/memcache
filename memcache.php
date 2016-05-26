@@ -25,9 +25,9 @@ define('DATE_FORMAT','Y/m/d H:i:s');
 define('GRAPH_SIZE',200);
 define('MAX_ITEM_DUMP',50);
 
-$MEMCACHE_SERVERS[] = 'mymemcache-server1:11211'; // add more as an array
-$MEMCACHE_SERVERS[] = 'mymemcache-server2:11211'; // add more as an array
 
+#$MEMCACHE_SERVERS[] = '127.0.0.1:11211';
+#$MEMCACHE_SERVERS[] = 'unix:///var/run/memcached/memcached.sock';
 
 ////////// END OF DEFAULT CONFIG AREA /////////////////////////////////////////////////////////////
 
@@ -241,6 +241,14 @@ function getMemcacheStats($total=true){
 }
 
 //////////////////////////////////////////////////////
+
+//
+// Refresh this page every minute
+//
+
+$proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] == 'on') ? "https":"http";
+$url = $proto."://".$_SERVER['HTTP_HOST'].":".$_SERVER['SERVER_PORT'].$_SERVER['REQUEST_URI'];
+header( 'Refresh: 60; url='.$url );
 
 //
 // don't cache this page
